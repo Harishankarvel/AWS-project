@@ -1,0 +1,8 @@
+# samconfig.toml
+version = 0.1
+[default]
+[default.deploy]
+region = "us-east-1"
+stack_name = "f2c-platform"
+resolve_s3 = true
+s3_bucket = "f2c-deployments-bucket"

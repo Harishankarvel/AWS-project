@@ -1,0 +1,211 @@
+# template.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless infrastructure for Farmer-to-Consumer (F2C) E‑Commerce Platform
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 256
+    Handler: lambda_function.lambda_handler
+    Environment:
+      Variables:
+        REGION: us-east-1
+        PREFIX: f2c-
+        S3_BUCKET: !Ref ModelBucket
+        DYNAMODB_TABLE: !Ref SingleTable
+
+Resources:
+  # S3 bucket for model artifacts and uploaded images
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: f2c-model-bucket
+      VersioningConfiguration:
+        Status: Enabled
+
+  # DynamoDB single‑table design
+  SingleTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: f2c-single-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  # Cognito User Pool for authentication (SMS OTP)
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: f2c-user-pool
+      UsernameAttributes:
+        - phone_number
+      SmsVerificationMessage: "Your verification code is {####}"
+      AutoVerifiedAttributes:
+        - phone_number
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 6
+          RequireUppercase: false
+          RequireLowercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+      MfaConfiguration: OFF
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: f2c-user-pool-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      RefreshTokenValidity: 30
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: f2c-identity-pool
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # IAM role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: f2c-lambda-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: f2c-lambda-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:* 
+                  - s3:* 
+                  - sns:Publish
+                  - states:StartExecution
+                Resource: '*'
+
+  # Inference Lambda (price recommendation)
+  InferenceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda_inference/
+      FunctionName: f2c-price-inference
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /infer
+            Method: post
+            RestApiId: !Ref ApiGateway
+
+  # Order processing Lambda (starts Step Functions)
+  OrderHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda_order_handler/
+      FunctionName: f2c-order-handler
+      Role: !GetAtt LambdaExecutionRole.Ari
+      Handler: handler.lambda_handler
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /order
+            Method: post
+            RestApiId: !Ref ApiGateway
+
+  # Inventory management Lambda (used inside Step Functions)
+  InventoryHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda_inventory_handler/
+      FunctionName: f2c-inventory-handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: handler.lambda_handler
+
+  # Payment processing Lambda (stub)
+  PaymentHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda_payment_handler/
+      FunctionName: f2c-payment-handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: handler.lambda_handler
+
+  # API Gateway (single API for all endpoints)
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: f2c-api
+      StageName: prod
+      Cors:
+        AllowOrigin: "*"
+        AllowMethods: "GET,POST,OPTIONS"
+        AllowHeaders: "Content-Type,Authorization"
+
+  # Step Functions state machine
+  OrderStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: f2c-order-workflow
+      RoleArn: !GetAtt LambdaExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Order processing workflow",
+          "StartAt": "ReserveInventory",
+          "States": {
+            "ReserveInventory": {
+              "Type": "Task",
+              "Resource": "${InventoryHandlerFunction.Arn}",
+              "Next": "ProcessPayment"
+            },
+            "ProcessPayment": {
+              "Type": "Task",
+              "Resource": "${PaymentHandlerFunction.Arn}",
+              "Next": "NotifyFarmer"
+            },
+            "NotifyFarmer": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:f2c-farmer-notifications",
+                "Message.$": "$.notificationMessage"
+              },
+              "End": true
+            }
+          }
+        }
+
+Outputs:
+  ApiEndpoint:
+    Description: URL of the API Gateway endpoint
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod
+  ModelBucketName:
+    Description: Bucket for model and image storage
+    Value: !Ref ModelBucket
+  DynamoTableName:
+    Description: DynamoDB single‑table name
+    Value: !Ref SingleTable
